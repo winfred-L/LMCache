@@ -430,6 +430,8 @@ class LMCacheEngine:
             have the same length as tokens. And the mask should ALWAYS be like
             FFFFFTTTTTTT, where True means the tokens needs to be matched,
             and the Falses will ALWAYS be at the PREFIX of the tensor.
+            后缀为 True 是需要检索缓存的部分
+            FFFFFTTTTT 形状是为了支持“部分历史已处理”的场景（如 streaming generation）
 
         :param **kwargs: The additional arguments for the storage backend which
             will be passed into the gpu_connector.
@@ -441,20 +443,25 @@ class LMCacheEngine:
 
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
+            这个检查在 token_database.process_tokens 中完成
         """
         tot_kv_size = 0
         t = time.perf_counter()
 
+        # 计算“需要检索”的 token 数量（即 mask=True 的个数）
         if mask is not None:
             num_required_tokens = torch.sum(mask).item()
         else:
             num_required_tokens = len(tokens)
+        
+        # 向 stats_monitor 注册一次检索请求，用于指标收集（如 QPS、吞吐量）
+        # TODO(lyc): 看 stats_monitor 功能
         monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
 
         reordered_chunks: List[Tuple[CacheEngineKey, MemoryObj, int, int]] = []
-        if not self._is_passive():
+        if not self._is_passive(): # 判断当前 rank 是否是“被动模式”（如在多卡设置中只接收广播而不主动检索）
             if self.async_loading:
                 reordered_chunks, tot_kv_size = self._async_process_tokens_internal(  # noqa: E501
                     tokens,
@@ -469,7 +476,7 @@ class LMCacheEngine:
                     ret_mask,
                     **kwargs,
                 )
-        if self.save_only_first_rank:
+        if self.save_only_first_rank: # 一种优化策略，只有 rank 0 保存/检索缓存，其他 rank 通过通信（如 NCCL broadcast）获取
             with torch.cuda.stream(self.broadcast_stream):
                 self._broadcast_or_receive_memory_objs(
                     reordered_chunks,
@@ -485,6 +492,7 @@ class LMCacheEngine:
             if not hasattr(self.gpu_connector, "load_stream"):
                 self.broadcast_stream.synchronize()
 
+        # 将缓存数据加载到 GPU
         # NOTE(Jiayi): memory_obj doesn't have to be a pinned
         # cpu tensor for the sake of performance.
         # For example, disk->gpu is faster than disk->cpu->gpu.
@@ -495,6 +503,7 @@ class LMCacheEngine:
                 list(memory_objs), list(starts), list(ends), **kwargs
             )
 
+        # 清理与引用计数
         # TODO(Jiayi): Remove the following for loop with batched operations
         # TODO(Jiayi): Need to refactor the `remove_after_retrieve` logic.
         for key, memory_obj, _, _ in reordered_chunks:
@@ -502,6 +511,7 @@ class LMCacheEngine:
                 self.storage_manager.remove(key)
             memory_obj.ref_count_down()
 
+        # 性能统计与日志
         onload_time = time.perf_counter() - t
 
         retrieved_tokens = torch.sum(ret_mask)
@@ -548,6 +558,12 @@ class LMCacheEngine:
             the memory objects of layer i+1 from the storage backends. In the
             last iteration, it moves the memory objects of the last layer to
             the GPU.
+            第 1 次迭代：从存储后端检索第 0 层的 memory objects
+            第 i 次迭代：将第 i-1 层的 memory objects 移动到 GPU，并从存储后端检索第 i 层的 memory objects
+            最后一次迭代：将最后一层的 memory objects 移动到 GPU，并返回最终的检索掩码 ret_mask
+            
+            最后一次 yield 返回 ret_mask，其他 yield 返回 None
+            特别地，第一次 yield 返回缓存命中数，用于通知调用方（如 SGLang）缓存命中情况。
         """
 
         if mask is not None:
@@ -565,13 +581,16 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        
+        # 切分 token 并生成多层缓存键
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
             mask=mask,
             request_configs=request_configs,
         ):
-            assert isinstance(key, CacheEngineKey)
+            assert isinstance(key, CacheEngineKey) # 这里的CacheEngineKey实际不存K向量，只是块的索引，MemoryObj才是存的数据
 
+            # 将单个 CacheEngineKey 拆分为 每层独立的 key 列表
             keys_multi_layer = key.split_layers(self.num_layers)
 
             # NOTE: Only check the first layer
@@ -588,8 +607,10 @@ class LMCacheEngine:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
+            # 启动 层缓存获取生成器
             get_generator = self.storage_manager.layerwise_batched_get(keys_layer_major)
 
+            # 启动 GPU 加载协程
             assert isinstance(
                 self.gpu_connector,
                 (
@@ -599,8 +620,9 @@ class LMCacheEngine:
                 ),
             )
             mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
-            next(mem_obj_consumer)
+            next(mem_obj_consumer) # “预热”协程
 
+            # 主循环：逐层处理
             to_count_down = []
             for layer_id in range(self.num_layers):
                 task = next(get_generator)
@@ -610,23 +632,25 @@ class LMCacheEngine:
                 if layer_id == 0:
                     # NOTE(Yuwei): For sglang integration we need to provide retrieved
                     # tokens number in the first layer loading since there is no lookup
-                    yield torch.sum(ret_mask)
+                    yield torch.sum(ret_mask) # 第一次 yield 通知缓存命中数
                 else:
                     yield None
 
-                mem_objs_layer = task.result()
+                mem_objs_layer = task.result() # 阻塞等待该层数据就绪
                 mem_obj_consumer.send(mem_objs_layer)
                 to_count_down.extend(mem_objs_layer)
 
+            # 引用计数清理
             for mem_obj in to_count_down:
                 mem_obj.ref_count_down()
+        # 处理无缓存命中的情况
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
             for layer_id in range(self.num_layers):
                 yield None
 
-        yield None
+        yield None # 额外 yield 可能是为了对齐调用方的迭代次数（取决于 gpu_connector 协程设计）
 
         # synchronize the last layer
         next(mem_obj_consumer)
@@ -1091,10 +1115,17 @@ class LMCacheEngine:
         This function is used to process tokens and populate the reordered lists.
 
         Args:
-            tokens: Input tokens to process
-            mask: Mask indicating valid token positions
-            ret_mask: Output mask updated with cache hit positions
+            tokens: Input tokens to process 待处理的 token 序列（通常是模型输入的 token ID 列表）
+            mask: Mask indicating valid token positions 一个布尔掩码，标记哪些 token 位置有效（例如，跳过 padding）
+            ret_mask: Output mask updated with cache hit positions 输出掩码，用于回写哪些 token 区间成功从缓存/存储中加载了 KV 缓存
             **kwargs: Additional keyword arguments
+
+        Returns:
+            A tuple containing:
+            - A list of tuples, each containing (CacheEngineKey, MemoryObj, start, end)
+              表示成功加载的 KV 缓存块及其对应的键和位置 (内存对象, 起始位置, 结束位置)
+            - An integer representing the total size of the KV caches loaded
+              成功加载的 KV 缓存总大小（以字节为单位）
         """
 
         tot_kv_size = 0
@@ -1110,12 +1141,15 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         for start, end, key in self.token_database.process_tokens(
+            # process_tokens() 负责将输入 token 序列按某种策略切分成多个区间, 并为每个区间生成一个 CacheEngineKey
+            # TODO(lyc): 是否可以实现一个自定义的 TokenDatabase 以支持区分视频和文本 token
             tokens=tokens,
             mask=mask,
             request_configs=request_configs,
         ):
             assert isinstance(key, CacheEngineKey)
 
+            # 检查 key 是否存在于存储后端
             if key in self.lookup_cache:
                 # TODO(Jiayi): we can reduce the number of `contains` calls
                 # by checking the lookup cache first (should be updated in `lookup`)
@@ -1130,12 +1164,14 @@ class LMCacheEngine:
                 # NOTE: Here we make the assumption that the underlying
                 # storage backend support pin operation, and the memory
                 # object is already pinned in the storage backend.
-                ret_mask[start:end] = True
+                ret_mask[start:end] = True # 标记该区间的 token 的 KV 缓存可用
 
             assert location is not None
-
+            
+            # 按存储位置分组缓存请求, 便于后续批量获取（batched_get）
             block_mapping[location].append((key, start, end))
 
+        # 批量从存储后端获取 MemoryObj
         last_failed_block_start = None
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
@@ -1147,6 +1183,7 @@ class LMCacheEngine:
                 "Failed to get memory objects from storage backend"
             )
 
+            # 组装结果并处理失败情况
             for (key, start, end), memory_obj in zip(blocks, memory_objs, strict=False):
                 if memory_obj is None:
                     logger.warning(
@@ -1161,6 +1198,7 @@ class LMCacheEngine:
                 reordered_chunks.append((key, memory_obj, start, end))
                 tot_kv_size += memory_obj.get_size()
 
+        # 处理失败后截断结果
         if last_failed_block_start is not None:
             ret_mask[last_failed_block_start:] = False
 

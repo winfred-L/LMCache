@@ -105,7 +105,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {v: k for k, v in TORCH_DTYPE_TO_STR_DTYPE.items()}
 class CacheEngineKey:
     fmt: str
     model_name: str
-    world_size: int
+    world_size: int # 分布式训练/推理的总 GPU 数，用于多卡缓存一致性
     worker_id: int
     chunk_hash: int
     request_configs: Optional[dict] = None

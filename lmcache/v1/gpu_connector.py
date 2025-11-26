@@ -792,6 +792,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         paged GPU memory. The last iteration simply waits for the last layer
         to finish.
         In total, this the generator will yield num_layers + 2 times.
+        第 1 次 yield：准备元数据（实际在函数开头完成）
+        中间 num_layers 次 yield：每次接收一层的 memory_objs_layer，然后异步加载到 GPU
+        最后 1 次 yield：等待最后一层完成
 
         :param starts: The starting indices of the KV cache in the corresponding
             token sequence.
@@ -799,7 +802,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         :param ends: The ending indices of the KV cache in the corresponding
             token sequence.
 
-        :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+        :raises ValueError: If 'slot_mapping' and 'sync' is not provided in kwargs.
         """
 
         self.initialize_kvcaches_ptr(**kwargs)
@@ -814,10 +817,13 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             raise ValueError("'sync' should be provided in kwargs.")
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        # slot_mapping：VLLM 中的关键数据结构，将逻辑 token 位置映射到物理 page table 中的 slot（即 (page_id, block_offset) 编码后的 1D tensor）
         sync: bool = kwargs["sync"]
+        # sync：是否启用 CUDA 流同步（通常为 True）
 
         self._lazy_initialize_buffer(self.kvcaches)
 
+        # 将分散的 slot_mapping[start:end] 拼接成一个连续的 tensor slot_mapping_full
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
             slot_mapping_chunks.append(slot_mapping[start:end])
@@ -827,6 +833,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         num_tokens = len(slot_mapping_full)
 
+        # （可选）分配临时 GPU buffer
         if self.use_gpu:
             buffer_shape = self.get_shape(num_tokens)
             assert self.gpu_buffer_allocator is not None
@@ -840,11 +847,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             )
             assert tmp_gpu_buffer_obj.tensor is not None
 
+        # 主循环 —— 逐层加载（核心流水线）
         offset = starts[0]
         current_stream = torch.cuda.current_stream()
 
         for layer_id in range(self.num_layers):
-            memory_objs_layer = yield
+            memory_objs_layer = yield # 接收上层 send() 的 memory_objs
             if sync:
                 current_stream.wait_stream(self.load_stream)
             if layer_id > 0:
@@ -879,7 +887,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         True,
                         self.vllm_two_major,
                     )
-        yield
+        yield # 第 num_layers + 1 次 yield：等待最后一层提交
 
         # synchronize the last layer
         if sync:

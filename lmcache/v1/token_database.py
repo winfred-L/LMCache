@@ -206,6 +206,7 @@ class ChunkedTokenDatabase(TokenDatabase):
         self,
         token_chunks: Iterable[Union[torch.Tensor, List[int]]],
     ) -> Iterable[int]:
+        # 将当前块的内容和前一个块的哈希值一起进行哈希
         prefix_hash = self._get_init_hash()
         for token_chunk in token_chunks:
             prefix_hash = self._hash_tokens(token_chunk, prefix_hash)
@@ -258,7 +259,7 @@ class ChunkedTokenDatabase(TokenDatabase):
                 "The number of Falses in the mask is not a multiple of the chunk size."
             )
 
-        if tokens is not None:
+        if tokens is not None: # 分支 A：传入的是 tokens (标准流程)
             total_len = len(tokens)
             token_chunks = self._chunk_tokens(tokens)
             prefix_hashes = self._prefix_hash(token_chunks)
@@ -276,7 +277,7 @@ class ChunkedTokenDatabase(TokenDatabase):
                         )
                     else:
                         yield start_idx, end_idx, hash_val
-        elif hashes is not None:
+        elif hashes is not None: # 分支 B：传入的是 hashes 和 offsets (优化/跨进程流程)
             assert offsets is not None, (
                 "If hashes are provided, offsets must also be provided."
             )
