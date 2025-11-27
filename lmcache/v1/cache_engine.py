@@ -536,7 +536,10 @@ class LMCacheEngine:
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Generator[Optional[torch.Tensor], None, None]:
+    ) -> Generator[Optional[torch.Tensor], Optional[List[int]], None]:
+        ### -> Generator[Optional[torch.Tensor], None, None]
+        # 修改：yield 接收外部传入的 selected_indices
+        # selected_indices 是一个 int list，表示保留第几个 chunk
         """
         Retrieve the KV cache in a layerwise manner.
 
@@ -566,6 +569,10 @@ class LMCacheEngine:
             特别地，第一次 yield 返回缓存命中数，用于通知调用方（如 SGLang）缓存命中情况。
         """
 
+        assert self.storage_manager is not None
+        assert self.gpu_connector is not None
+
+        # --- 1. 预处理与统计信息 (保持原样) ---
         if mask is not None:
             num_required_tokens = torch.sum(mask).item()
         else:
@@ -582,7 +589,9 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
         
-        # 切分 token 并生成多层缓存键
+        location = None
+        
+        # --- 2. Token 处理与 Key 生成 (保持原样) ---
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
             mask=mask,
@@ -594,7 +603,17 @@ class LMCacheEngine:
             keys_multi_layer = key.split_layers(self.num_layers)
 
             # NOTE: Only check the first layer
-            if not self.storage_manager.contains(keys_multi_layer[0]):
+            if current_location := self.storage_manager.contains(keys_multi_layer[0]):
+                if location is None:
+                    location = current_location
+                else:
+                    # TODO(Jiayi): Support multi-location retrieval in the future
+                    assert location == current_location, (
+                        "All retrieved keys should be from the same location "
+                        "when use layerwise retrieval."
+                        "Please support multi-location retrieval in the future."
+                    )
+            else:
                 break
 
             starts.append(start)
@@ -603,14 +622,37 @@ class LMCacheEngine:
 
             ret_mask[start:end] = True
 
+        # --- 3. 流水线加载逻辑 (核心修改) ---
         if keys:
-            # Transpose the keys into layer major format
+            # Transpose the keys into layer major format: [num_layers, num_chunks]
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
-            # 启动 层缓存获取生成器
-            get_generator = self.storage_manager.layerwise_batched_get(keys_layer_major)
+            # [新增] 定义动态 Key 提供者
+            # 使用列表作为引用容器，以便在闭包中更新当前层的 keys
+            current_layer_keys_ref = [None]
+            
+            def key_provider_gen():
+                """生成器：按需提供每一层的 keys 给 layerwise_batched_get"""
+                for _ in range(self.num_layers):
+                    # 每次 backend 请求任务时，都会获取最新的 keys
+                    yield current_layer_keys_ref[0]
 
-            # 启动 GPU 加载协程
+            # [新增] 初始化第 0 层（默认为全量加载）
+            keys0 = keys_layer_major[0]
+            current_layer_keys_ref[0] = keys0
+
+            ### # 启动 Backend 任务生成器
+            ### get_generator = self.storage_manager.layerwise_batched_get(keys_layer_major)
+            # 利用 layerwise_batched_get 的异步特性，它会立即消耗 generator 并提交第一个任务
+            backend_task_gen = self.storage_manager.layerwise_batched_get(
+                key_provider_gen(),
+                location=location,
+            )
+
+            # [Pipeline Step 1]: 立即提交第 0 层的任务 (Pre-fetch Layer 0)
+            current_task = next(backend_task_gen)
+
+            # 初始化 GPU 消费者
             assert isinstance(
                 self.gpu_connector,
                 (
@@ -620,29 +662,72 @@ class LMCacheEngine:
                 ),
             )
             mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
-            next(mem_obj_consumer) # “预热”协程
+            next(mem_obj_consumer) # 启动 consumer
 
-            # 主循环：逐层处理
             to_count_down = []
+            selected_indices_current = None # 第 0 层默认全选，所以是 None
+
+            # 进入按层循环
             for layer_id in range(self.num_layers):
-                task = next(get_generator)
+                # [交互]: 将控制权交还给 Runner，通知当前层准备就绪
+                # 第一层返回 token 数量，后续层返回 None
+                yield_val = torch.sum(ret_mask) if layer_id == 0 else None
+                # Runner 计算完当前层（或进行预处理）后，通过 send() 发送下一层的预测索引 selected_indices
+                selected_indices_next = yield yield_val
 
-                assert task is not None
-
-                if layer_id == 0:
-                    # NOTE(Yuwei): For sglang integration we need to provide retrieved
-                    # tokens number in the first layer loading since there is no lookup
-                    yield torch.sum(ret_mask) # 第一次 yield 通知缓存命中数
+                # [Pipeline Step 2]: 立即提交下一层 (Layer i+1) 的任务
+                # 此时利用 Runner 发来的 selected_indices_next 进行预测加载
+                next_layer_id = layer_id + 1
+                if next_layer_id < self.num_layers:
+                    # 根据索引筛选下一层的 keys
+                    if selected_indices_next is not None:
+                        next_keys = [keys_layer_major[next_layer_id][i] for i in selected_indices_next]
+                    else:
+                        next_keys = keys_layer_major[next_layer_id] # 没传索引则全量加载
+                    
+                    # 更新 Key Provider 的状态
+                    current_layer_keys_ref[0] = next_keys
+                    
+                    # 驱动 backend 生成器继续运行，提交异步任务
+                    next_task = next(backend_task_gen)
                 else:
-                    yield None
+                    next_task = None
 
-                mem_objs_layer = task.result() # 阻塞等待该层数据就绪
-                mem_obj_consumer.send(mem_objs_layer)
-                to_count_down.extend(mem_objs_layer)
+                # [Pipeline Step 3]: 等待当前层 (Layer i) 加载完成
+                # 这里的 current_task 是在上一轮循环（或初始阶段）提交的
+                mem_objs_layer = current_task.result()
+
+                # [Pipeline Step 4]: 数据搬运 (H2D)
+                if mem_objs_layer:
+                    # 根据当前层的选择索引，筛选对应的 starts 和 ends
+                    # 确保稀疏数据写入 GPU 显存的正确物理位置
+                    if selected_indices_current is not None:
+                        cur_starts = [starts[i] for i in selected_indices_current]
+                        cur_ends = [ends[i] for i in selected_indices_current]
+                    else:
+                        cur_starts = starts
+                        cur_ends = ends
+
+                    # 发送元组给 GPU Connector: (数据对象, 动态Starts, 动态Ends)
+                    mem_obj_consumer.send((mem_objs_layer, cur_starts, cur_ends))
+
+                    # 收集对象以待后续引用计数递减
+                    to_count_down.extend(mem_objs_layer)
+
+                # [Pipeline Step 5]: 轮转状态
+                current_task = next_task
+                selected_indices_current = selected_indices_next
 
             # 引用计数清理
             for mem_obj in to_count_down:
                 mem_obj.ref_count_down()
+
+            # 关闭 GPU Consumer，触发最后的同步等待
+            try:
+                next(mem_obj_consumer)
+            except StopIteration:
+                pass
+        
         # 处理无缓存命中的情况
         else:
             # If no cache are found, we still need to yield to avoid
@@ -650,10 +735,8 @@ class LMCacheEngine:
             for layer_id in range(self.num_layers):
                 yield None
 
-        yield None # 额外 yield 可能是为了对齐调用方的迭代次数（取决于 gpu_connector 协程设计）
-
-        # synchronize the last layer
-        next(mem_obj_consumer)
+        # --- 4. 收尾逻辑 (保持原样) ---
+        yield None # 同步信号
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)

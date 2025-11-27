@@ -668,7 +668,8 @@ class LMCacheConnectorV1Impl:
         self.num_layers = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
-        self.current_layer = 0
+        self.current_layer_load = 0
+        self.current_layer_save = 0
 
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
 
@@ -789,7 +790,8 @@ class LMCacheConnectorV1Impl:
             The number of elements in kv_caches and layer_names should be
             the same.
         """
-        self.current_layer = 0
+        self.current_layer_load = 0
+        self.current_layer_save = 0
 
         if len(self.kv_caches) == 0:
             self._init_kv_caches_from_forward_context(forward_context)
@@ -861,7 +863,10 @@ class LMCacheConnectorV1Impl:
                     )
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
-                    next(layerwise_retriever)
+                    ### next(layerwise_retriever)
+                    # [修改] 只启动一次！
+                    # 这会触发 retrieve_layer 中的 "Pre-fetch Layer 0" 并暂停。
+                    # 此时第 0 层正在后台加载，generator 等待接收第 1 层的 indices。
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
@@ -900,18 +905,58 @@ class LMCacheConnectorV1Impl:
             layer_name: the name of that layer
         """
         if self.layerwise_retrievers:
-            logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
+            logger.debug(f"Waiting for layer {self.current_layer_load} to be loaded")
 
-        # Wait for the layer to be loaded
-        for layerwise_retriever in self.layerwise_retrievers:
-            ret_token_mask = next(layerwise_retriever)
+        next_layer_load = self.current_layer_load + 1
 
-            if self.current_layer == self.num_layers - 1:
-                assert ret_token_mask is not None
-                num_retrieved_tokens = ret_token_mask.sum().item()
-                logger.info(f"Retrieved {num_retrieved_tokens} tokens")
+        # 遍历所有请求的检索器
+        # (通常 batch 中会有多个 request，每个 request 都有自己的 layerwise_retriever)
+        for idx, layerwise_retriever in enumerate(self.layerwise_retrievers):
+            # [修改] 获取动态稀疏索引
+            if next_layer_load < self.num_layers:
+                # 假设您有一个方法可以根据 request 和 layer_id 预测
+                # 返回格式应为 List[int] (Chunk Indices) 或 None (代表全量)
+                selected_indices = self._predict_indices(idx, next_layer_load)
+            else:
+                selected_indices = None
 
-        return
+            try:
+                ### ret_token_mask = next(layerwise_retriever)
+                # 使用 send() 发送索引并等待当前层加载完成
+                ret_token_mask = layerwise_retriever.send(selected_indices)
+                # 逻辑流：
+                # 1. send(indices) -> 唤醒 generator
+                # 2. generator 提交 next_layer_load 的加载任务 (使用 selected_indices)
+                # 3. generator 等待 self.current_layer_load 的加载任务完成
+                # 4. generator 返回 self.current_layer_load 的结果
+
+                # 检查是否是最后一层（仅用于日志/统计）
+                if self.current_layer_load == self.num_layers - 1:
+                    assert ret_token_mask is not None
+                    num_retrieved_tokens = ret_token_mask.sum().item()
+                    logger.info(f"Retrieved {num_retrieved_tokens} tokens")
+
+            except StopIteration:
+                continue
+
+        self.current_layer_load += 1
+
+    @_lmcache_nvtx_annotate
+    def _predict_indices(
+        self,
+        request_idx: int,
+        layer_id: int,
+    ) -> Optional[list[int]]:
+        """Predict chunk indices for dynamic sparse retrieval.
+
+        Args:
+            request_idx (int): Index of the request in the batch.
+            layer_id (int): Current layer ID.
+        Returns:
+            Optional[list[int]]: List of chunk indices to retrieve, or None for full retrieval.
+        """
+        return None
+        self.lmcache_engine.token_database
 
     @_lmcache_nvtx_annotate
     def save_kv_layer(
@@ -950,7 +995,7 @@ class LMCacheConnectorV1Impl:
         assert len(self.kv_caches) > 0
 
         kvcaches = list(self.kv_caches.values())
-        if self.current_layer == 0:
+        if self.current_layer_save == 0:
             self.layerwise_storers = []
 
             is_first = True
@@ -1013,7 +1058,7 @@ class LMCacheConnectorV1Impl:
         for layerwise_storer in self.layerwise_storers:
             next(layerwise_storer)
 
-        self.current_layer += 1
+        self.current_layer_save += 1
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):

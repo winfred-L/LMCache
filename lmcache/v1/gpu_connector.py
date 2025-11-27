@@ -783,6 +783,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
     @_lmcache_nvtx_annotate
     def batched_to_gpu(self, starts: List[int], ends: List[int], **kwargs):
+        # 修改 yield Receives (via send):
+        # 可以是 memory_objs_layer (兼容旧逻辑)
+        # 也可以是 tuple(memory_objs_layer, cur_starts, cur_ends) (新逻辑，支持动态稀疏)
         """
         This function is a generator that moves the KV cache from the memory
         objects to paged GPU memory. The first iteration will prepare some
@@ -829,13 +832,16 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             slot_mapping_chunks.append(slot_mapping[start:end])
 
         # TODO(Jiayi): Optimize away this `cat`
-        slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
-
-        num_tokens = len(slot_mapping_full)
+        ### slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
+        ### num_tokens = len(slot_mapping_full)
+        slot_mapping_full_static = torch.cat(slot_mapping_chunks, dim=0)
+        max_num_tokens = len(slot_mapping_full_static)
+        # [优化] 仅初始化一次缓冲区，按最大需求分配
 
         # （可选）分配临时 GPU buffer
         if self.use_gpu:
-            buffer_shape = self.get_shape(num_tokens)
+            ### buffer_shape = self.get_shape(num_tokens)
+            buffer_shape = self.get_shape(max_num_tokens)
             assert self.gpu_buffer_allocator is not None
             tmp_gpu_buffer_obj: Optional[MemoryObj] = (
                 self.gpu_buffer_allocator.allocate(
@@ -848,41 +854,76 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             assert tmp_gpu_buffer_obj.tensor is not None
 
         # 主循环 —— 逐层加载（核心流水线）
-        offset = starts[0]
+        ### offset = starts[0] # [修改] 不再依赖静态 offset
         current_stream = torch.cuda.current_stream()
 
         for layer_id in range(self.num_layers):
-            memory_objs_layer = yield # 接收上层 send() 的 memory_objs
+            ### memory_objs_layer = yield # 接收上层 send() 的 memory_objs
+            received_data = yield # [修改] 接收动态参数
+            
+            if isinstance(received_data, tuple):
+                # 新模式：接收 (objs, starts, ends)
+                memory_objs_layer, cur_starts, cur_ends = received_data
+            else:
+                # 兼容旧模式：默认全量
+                memory_objs_layer = received_data
+                cur_starts, cur_ends = starts, ends
+
             if sync:
                 current_stream.wait_stream(self.load_stream)
             if layer_id > 0:
                 logger.debug(f"Finished loading layer {layer_id - 1}")
 
+            # [修改] 为当前层动态构建 slot_mapping
+            # 虽然这里有 Python 开销，但相比 GPU 内存分配和拷贝是微不足道的
+            cur_slot_mapping_chunks = [slot_mapping[s:e] for s, e in zip(cur_starts, cur_ends)]
+            if not cur_slot_mapping_chunks:
+                continue # 这一层什么都不加载
+            cur_slot_mapping_full = torch.cat(cur_slot_mapping_chunks, dim=0)
+            
             # memobj -> gpu_buffer -> kvcaches
             with torch.cuda.stream(self.load_stream):
+                buffer_offset = 0 # [修改] 使用紧凑填充指针
+
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
                 ):
                     assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
+                    
+                    chunk_len = end - start
+
                     if self.use_gpu:
-                        tmp_gpu_buffer_obj.tensor[start - offset : end - offset].copy_(
+                        ### tmp_gpu_buffer_obj.tensor[start - offset : end - offset].copy_(
+                        ###     memory_obj.tensor, non_blocking=True
+                        ### )
+                        # [修改] 紧凑拷贝到 buffer，不留空隙
+                        # 这样可以复用同一个大 buffer 而不需要关心 offset
+                        tmp_gpu_buffer_obj.tensor[buffer_offset : buffer_offset + chunk_len].copy_(
                             memory_obj.tensor, non_blocking=True
                         )
                     else:
+                        # CPU 直接传输模式：直接使用当前 chunk 的 slot mapping
                         lmc_ops.single_layer_kv_transfer(
                             memory_obj.tensor,
                             self.kvcaches[layer_id],
-                            slot_mapping_full,
+                            ### slot_mapping_full,
+                            slot_mapping[start:end], # 修正原代码潜在 bug：使用切片而非 full
                             False,
                             True,
                             self.vllm_two_major,
                         )
 
+                    buffer_offset += chunk_len
+
                 if self.use_gpu:
+                    # [修改] 将缓冲区中的有效数据 (0 : buffer_offset) 传输到 kvcaches
+                    # 这里的 cur_slot_mapping_full 已经对应了紧凑排列的数据
                     lmc_ops.single_layer_kv_transfer(
-                        tmp_gpu_buffer_obj.tensor,
+                        ### tmp_gpu_buffer_obj.tensor,
+                        tmp_gpu_buffer_obj.tensor[:buffer_offset], # 仅使用有效部分
                         self.kvcaches[layer_id],
-                        slot_mapping_full,
+                        ### slot_mapping_full,
+                        cur_slot_mapping_full,
                         False,
                         True,
                         self.vllm_two_major,

@@ -10,6 +10,7 @@ from typing import (
     List,
     Optional,
     Sequence,
+    Union,
 )
 import asyncio
 import functools
@@ -398,7 +399,8 @@ class StorageManager:
 
     def layerwise_batched_get(
         self,
-        keys: List[List[CacheEngineKey]],
+        ### keys: List[List[CacheEngineKey]],
+        keys: Union[List[List[CacheEngineKey]], Generator[List[CacheEngineKey], None, None]], # 允许 keys 接收迭代器
         location: Optional[str] = None,
     ) -> Generator[Future, None, None]:
         """
@@ -416,6 +418,7 @@ class StorageManager:
         if location is None:
             location = "LocalCPUBackend"
 
+        # for循环会自动对 generator 执行 next()，从而实现按需获取下一层的 keys
         for keys_multi_chunk in keys:
             # Retrieve all chunks for one layer
             backend = self.storage_backends[location]
